@@ -163,7 +163,7 @@
     <span class="endpoints">POST /synthesize · GET /voices · GET /service</span>
   </header>
 
-  <h1>Readium speech server <span class="em">demo</span></h1>
+  <h1>Readium Speech Server <span class="em">Demo</span></h1>
   <p class="lede">A live console for the Readium Speech Server. Write a line, pick a voice, and listen,  the waveform is the real audio the API returns.</p>
 
   <div class="script">
@@ -213,11 +213,25 @@
       <div class="field"><label for="strategy">Format strategy</label>
         <select id="strategy"><option value="quality">quality</option><option value="bandwidth">bandwidth</option></select>
       </div>
+      <div class="field"><label for="bitrate">Bitrate <small>— mp3/opus only</small></label>
+        <select id="bitrate">
+          <option value="32">32 kbps</option>
+          <option value="64">64 kbps</option>
+          <option value="96">96 kbps</option>
+          <option value="128" selected>128 kbps</option>
+          <option value="192">192 kbps</option>
+        </select>
+      </div>
     </div>
     <div class="checks">
       <label class="check" id="ssmlRow"><input id="ssml" type="checkbox" /> Treat text as SSML</label>
       <label class="check" id="boundaryRow"><input id="boundary" type="checkbox" /> Highlight words as spoken <small>— voice must support timing</small></label>
+      <label class="check"><input id="adaptBitrate" type="checkbox" /> Adapt bitrate to network</label>
     </div>
+    <p style="font-size:0.75rem;color:var(--muted);margin:0.5rem 0 0;">Bitrate is shown in the API
+      request below — it's the raw <code>output.bitrate</code> escape hatch for developers calling
+      <code>/synthesize</code> directly. The player itself (via the npm engine) picks its own bitrate
+      from the strategy/adapt-to-network options above, not from this select.</p>
   </details>
 
   <details id="apiPanel">
@@ -244,6 +258,7 @@ const el = id => document.getElementById(id);
 const textEl=el('text'), voiceEl=el('voice'), formatEl=el('format'), languageEl=el('language'), vmetaEl=el('vmeta');
 const readingEl=el('reading');
 const speedEl=el('speed'), pitchEl=el('pitch'), strategyEl=el('strategy');
+const bitrateEl=el('bitrate'), adaptBitrateEl=el('adaptBitrate');
 const ssmlEl=el('ssml'), boundaryEl=el('boundary');
 const outputEl=el('output'), curlEl=el('curl'), bannerEl=el('banner');
 const speakBtn=el('speakBtn'), speakLabel=el('speakLabel'), downloadBtn=el('downloadBtn');
@@ -307,16 +322,35 @@ async function instrumentedFetch(url, init) {
   return resp;
 }
 
-/* engine/navigator, rebuilt whenever the format preference or strategy changes — both are
-   SpeechServerEngine constructor-only options, there's no per-call override. */
+/* engine/navigator, rebuilt whenever the format preference, strategy, or adapt-to-network
+   toggle changes — all three are SpeechServerEngine constructor-only options (see
+   SpeechServerFormatOptions), there's no per-call override and, notably, no numeric bitrate
+   option either — the engine picks bitrate itself. The Bitrate select below is a separate,
+   API-request-only control (see requestBody()) for developers calling /synthesize directly. */
 let engine = null, speechNavigator = null;
 const decorations = setupDecorations();
 let voices = [];
+let serviceCaps = null;
 
 function currentFormatOptions() {
-  const opts = { strategy: strategyEl.value || 'quality' };
+  const opts = { strategy: strategyEl.value || 'quality', adaptBitrateToNetwork: adaptBitrateEl.checked };
   if (formatEl.value) opts.preferredFormat = formatEl.value;
   return opts;
+}
+// Bitrate only means anything for lossy formats — matches the API's own
+// `output.bitrate` docstring ("only meaningful for mp3/opus").
+function updateBitrateEnabled() {
+  bitrateEl.disabled = !(formatEl.value === 'mp3' || formatEl.value === 'opus');
+}
+// A preset nudges the format select to a sensible starting point; it never fights
+// a format/bitrate choice the user makes afterward (Hadrien: advanced users keep
+// full control).
+function onStrategyChange() {
+  if (formatEl.value) {
+    const wanted = strategyEl.value === 'bandwidth' ? 'opus' : 'wav';
+    if ([...formatEl.options].some(o => o.value === wanted)) formatEl.value = wanted;
+  }
+  updateBitrateEnabled();
 }
 async function rebuildEngine() {
   const prevVoiceId = voiceEl.value;
@@ -337,11 +371,14 @@ const prefix = t => (t||'').split('-')[0].toLowerCase();
 const voiceLangs = v => new Set([prefix(v.language), ...(v.otherLanguages||[]).map(prefix)]);
 
 /* request building — a prediction of what SpeechServerEngine will actually send (it always
-   requests boundary:true and an explicit speed/pitch; format/bitrate come from `format`
-   passed at construction, not per-call, so this can only reflect the currently built engine). */
+   requests boundary:true and an explicit speed/pitch; format comes from `format` passed at
+   construction, not per-call, so this can only reflect the currently built engine). `bitrate`
+   is the one field the engine itself never sends — shown here only as the raw API's granular
+   escape hatch for developers bypassing the engine (see Bitrate select in Advanced options). */
 function requestBody() {
   const output = { format: formatEl.value, speed: speedEl.value && !speedEl.disabled ? (parseFloat(speedEl.value) || 1) : 1 };
   if (pitchEl.value && !pitchEl.disabled) output.pitch = parseFloat(pitchEl.value);
+  if (!bitrateEl.disabled && bitrateEl.value) output.bitrate = parseInt(bitrateEl.value, 10);
   const body = { text: textEl.value, voice: voiceEl.value, language: languageEl.value, boundary: true, output };
   if (ssmlEl.checked && !ssmlEl.disabled) body.ssml = true;
   return body;
@@ -357,7 +394,8 @@ function updateCurl() {
 /* voice / language */
 function updateControlsForVoice() {
   const v = voices.find(x => x.identifier === voiceEl.value);
-  const c = (v && v.controls) || {};
+  const provCaps = v && serviceCaps && serviceCaps.providers.find(p => p.id === v.provider);
+  const c = (provCaps && provCaps.controls) || {};
   const setEnabled = (input, ok, rowId) => {
     input.disabled = !ok;
     if (rowId) el(rowId).classList.toggle('off', !ok);
@@ -389,7 +427,8 @@ function renderVoices() {
     const group = document.createElement('optgroup'); group.label = nameOfLang(tag);
     for (const v of list) {
       const opt = document.createElement('option');
-      opt.value = v.identifier; opt.textContent = `${v.name} — ${v.gender || 'voice'}`;
+      const provider = v.provider ? (PROVIDER_NAMES[v.provider] || v.provider) : null;
+      opt.value = v.identifier; opt.textContent = provider ? `${v.name} — ${v.gender || 'voice'} · ${provider}` : `${v.name} — ${v.gender || 'voice'}`;
       group.appendChild(opt);
     }
     voiceEl.appendChild(group);
@@ -412,6 +451,7 @@ async function loadData() {
       speechNavigator.getVoices(),
     ]);
   } catch (e) { showError('Could not reach the server. Is it running?'); return; }
+  serviceCaps = svc;
 
   formatEl.innerHTML = '';
   for (const f of svc.output.formats) {
@@ -420,6 +460,7 @@ async function loadData() {
     formatEl.appendChild(opt);
   }
   formatEl.value = svc.output.default;
+  updateBitrateEnabled();
 
   voices = voiceList;
   if (!voices.length) { showError('No voices installed. Configure a provider and restart.'); }
@@ -746,10 +787,11 @@ languageEl.addEventListener('change', onLanguageChange);
 const onVoicePick = () => { updateControlsForVoice(); updateCurl(); };
 voiceEl.addEventListener('change', onVoicePick);
 voiceEl.addEventListener('input', onVoicePick);
-const onFormatPrefChange = async () => { await rebuildEngine(); updateControlsForVoice(); updateCurl(); };
+const onFormatPrefChange = async () => { updateBitrateEnabled(); await rebuildEngine(); updateControlsForVoice(); updateCurl(); };
 formatEl.addEventListener('change', onFormatPrefChange);
-strategyEl.addEventListener('change', onFormatPrefChange);
-for (const e of [textEl, speedEl, pitchEl, ssmlEl, boundaryEl]) {
+adaptBitrateEl.addEventListener('change', onFormatPrefChange);
+strategyEl.addEventListener('change', async () => { onStrategyChange(); await onFormatPrefChange(); });
+for (const e of [textEl, speedEl, pitchEl, ssmlEl, boundaryEl, bitrateEl]) {
   e.addEventListener('input', updateCurl); e.addEventListener('change', updateCurl);
 }
 textEl.addEventListener('keydown', e => { if ((e.metaKey||e.ctrlKey) && e.key === 'Enter') speak(); });
